@@ -1,0 +1,367 @@
+name: Fix Video Editor Final
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  fix:
+    if: ${{ !contains(github.event.head_commit.message, '[editor-final]') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Replace editor implementation safely
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path('app.py')
+          text = p.read_text(encoding='utf-8')
+
+          # The first three modules are frozen. Only ensure the fourth tab exists.
+          if 'video_editor_tab' not in text:
+              pattern = re.compile(r'recognition_tab,correction_tab,translation_tab\s*=\s*st\.tabs\(\[[^\n]+\]\)')
+              replacement = 'recognition_tab,correction_tab,translation_tab,video_editor_tab=st.tabs(["🎙️ Speech Recognition","✨ AI Correction","🌐 Translation","🎬 Video Editor"])'
+              text, n = pattern.subn(replacement, text, count=1)
+              if n != 1:
+                  raise SystemExit('Cannot locate the existing three-tab declaration; refusing to touch frozen modules.')
+
+          # Remove every previous editor implementation from its section to EOF.
+          markers = [
+              '# ==================== VIDEO EDITOR V2',
+              '# ==================== VIDEO EDITOR',
+              '# ---------------- VIDEO EDITOR',
+          ]
+          positions = [text.find(m) for m in markers if text.find(m) >= 0]
+          if positions:
+              text = text[:min(positions)].rstrip() + '\n'
+
+          editor = r'''
+
+# ==================== VIDEO EDITOR FINAL ====================
+# Isolated subtitle editor. Recognition, correction and translation above are frozen.
+
+def editor_parse_time(value):
+    value = value.strip().replace('.', ',')
+    m = re.match(r'^(\d+):(\d+):(\d+),(\d+)$', value)
+    if not m:
+        raise ValueError(value)
+    h, mi, s, ms = map(int, m.groups())
+    return h * 3600 + mi * 60 + s + ms / 1000.0
+
+
+def editor_parse_srt(content):
+    content = content.replace('\r\n', '\n').replace('\r', '\n').strip()
+    blocks = re.split(r'\n\s*\n', content)
+    result = []
+    for block in blocks:
+        lines = block.splitlines()
+        ti = next((i for i, line in enumerate(lines) if '-->' in line), None)
+        if ti is None or ti + 1 >= len(lines):
+            continue
+        try:
+            left, right = lines[ti].split('-->', 1)
+            start = editor_parse_time(left.strip().split()[0])
+            end = editor_parse_time(right.strip().split()[0])
+        except Exception:
+            continue
+        # CRITICAL: preserve physical line breaks. Bilingual SRTs are normally two lines.
+        subtitle = '\n'.join(line.rstrip() for line in lines[ti + 1:]).strip()
+        if subtitle and end > start:
+            result.append([start, end, subtitle])
+    return result
+
+
+def editor_ass_escape(value):
+    return str(value).replace('\\', r'\\').replace('{', r'\\{').replace('}', r'\\}')
+
+
+def editor_ass_color(hex_color):
+    h = str(hex_color).lstrip('#')
+    if len(h) != 6:
+        h = 'FFFFFF'
+    return f'&H00{h[4:6]}{h[2:4]}{h[0:2]}'
+
+
+def editor_font_for_char(ch):
+    o = ord(ch)
+    if 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF:
+        return 'Noto Sans CJK SC'
+    if 0x3040 <= o <= 0x30FF:
+        return 'Noto Sans CJK JP'
+    if 0xAC00 <= o <= 0xD7AF:
+        return 'Noto Sans CJK KR'
+    if 0x0900 <= o <= 0x097F:
+        return 'Noto Sans Devanagari'
+    if 0x0600 <= o <= 0x06FF or 0x0750 <= o <= 0x077F or 0x08A0 <= o <= 0x08FF:
+        return 'Noto Sans Arabic'
+    if 0x0E00 <= o <= 0x0E7F:
+        return 'Noto Sans Thai'
+    if 0x0590 <= o <= 0x05FF:
+        return 'Noto Sans Hebrew'
+    if 0x0400 <= o <= 0x04FF:
+        return 'Noto Sans'
+    return None
+
+
+def editor_char_units(ch):
+    o = ord(ch)
+    if ch.isspace():
+        return 0.35
+    if (0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or
+        0x3040 <= o <= 0x30FF or 0xAC00 <= o <= 0xD7AF):
+        return 1.0
+    if (0x0900 <= o <= 0x097F or 0x0600 <= o <= 0x06FF or
+        0x0750 <= o <= 0x077F or 0x0E00 <= o <= 0x0E7F or
+        0x0590 <= o <= 0x05FF):
+        return 0.95
+    if o >= 0x1F300:
+        return 1.0
+    return 0.55
+
+
+def editor_wrap_line(line, max_units):
+    line = str(line).strip()
+    if not line:
+        return ''
+
+    # CJK / script-heavy lines: wrap by display-width units and never require spaces.
+    if any(editor_char_units(ch) >= 0.95 for ch in line) and ' ' not in line:
+        result, buf, units = [], [], 0.0
+        for ch in line:
+            width = editor_char_units(ch)
+            if buf and units + width > max_units:
+                result.append(''.join(buf))
+                buf, units = [], 0.0
+            buf.append(ch)
+            units += width
+        if buf:
+            result.append(''.join(buf))
+        return '\n'.join(result)
+
+    # Latin/mixed lines: wrap at word boundaries first, but split a single oversized word.
+    words = line.split()
+    result, buf, units = [], [], 0.0
+    for word in words:
+        width = sum(editor_char_units(ch) for ch in word)
+        separator = 0.35 if buf else 0.0
+        if buf and units + separator + width > max_units:
+            result.append(' '.join(buf))
+            buf, units = [], 0.0
+        if width > max_units:
+            if buf:
+                result.append(' '.join(buf))
+                buf, units = [], 0.0
+            chunk, chunk_units = [], 0.0
+            for ch in word:
+                cw = editor_char_units(ch)
+                if chunk and chunk_units + cw > max_units:
+                    result.append(''.join(chunk))
+                    chunk, chunk_units = [], 0.0
+                chunk.append(ch)
+                chunk_units += cw
+            if chunk:
+                buf, units = chunk, chunk_units
+        else:
+            buf.append(word)
+            units += separator + width
+    if buf:
+        result.append(' '.join(buf))
+    return '\n'.join(result)
+
+
+def editor_wrap_bilingual(text, max_units):
+    normalized = str(text).replace('\r\n', '\n').replace('\r', '\n')
+    # Wrap every existing subtitle line independently, so source and translation stay separate.
+    return '\n'.join(editor_wrap_line(part, max_units) for part in normalized.split('\n'))
+
+
+def editor_ass_runs(text, default_font):
+    # Explicit ASS font runs prevent missing-glyph squares for scripts not covered by the base font.
+    out, buf, active = [], [], None
+
+    def flush():
+        nonlocal buf, active
+        if not buf:
+            return
+        chunk = editor_ass_escape(''.join(buf))
+        if active and active != default_font:
+            out.append(r'{\fn' + active + '}' + chunk + r'{\fn' + default_font + '}')
+        else:
+            out.append(chunk)
+        buf = []
+
+    for ch in str(text):
+        if ch == '\n':
+            flush()
+            out.append(r'\N')
+            active = None
+            continue
+        wanted = editor_font_for_char(ch) or default_font
+        if active is None:
+            active = wanted
+        elif wanted != active:
+            flush()
+            active = wanted
+        buf.append(ch)
+    flush()
+    return ''.join(out)
+
+
+def editor_ass_time(seconds):
+    total = max(0, int(round(float(seconds) * 100)))
+    cs = total % 100
+    total //= 100
+    sec = total % 60
+    total //= 60
+    minute = total % 60
+    hour = total // 60
+    return f'{hour}:{minute:02d}:{sec:02d}.{cs:02d}'
+
+
+def editor_build_ass(segments, font_name, font_size, text_color, bold, italic, underline,
+                     position, margin_v, outline_width, outline_color, wrap_units):
+    alignment = {'Bottom': 2, 'Middle': 5, 'Top': 8}[position]
+    primary = editor_ass_color(text_color)
+    outline = editor_ass_color(outline_color)
+    bold_value = -1 if bold else 0
+    italic_value = -1 if italic else 0
+    underline_value = -1 if underline else 0
+
+    lines = [
+        '[Script Info]',
+        'ScriptType: v4.00+',
+        'PlayResX: 1920',
+        'PlayResY: 1080',
+        'WrapStyle: 2',
+        'ScaledBorderAndShadow: yes',
+        '',
+        '[V4+ Styles]',
+        'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding',
+        f'Style: Default,{font_name},{font_size},{primary},&H00FFFFFF,{outline},&HFF000000,{bold_value},{italic_value},{underline_value},0,100,100,0,0,1,{int(outline_width)},0,{alignment},70,70,{int(margin_v)},1',
+        '',
+        '[Events]',
+        'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text',
+    ]
+
+    for start, end, text in segments:
+        wrapped = editor_wrap_bilingual(text, wrap_units)
+        rendered = editor_ass_runs(wrapped, font_name)
+        lines.append(f'Dialogue: 0,{editor_ass_time(start)},{editor_ass_time(end)},Default,,0,0,0,,{rendered}')
+    return '\n'.join(lines) + '\n'
+
+
+def editor_render_video(video_path, ass_path, output_path):
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError('FFmpeg was not found. Make sure packages.txt contains ffmpeg and redeploy.')
+    # Use libass/fontconfig. No opaque subtitle box is used; only text + optional outline.
+    subtitle_filter = "subtitles='" + str(ass_path).replace('\\', '\\\\').replace("'", "\\'") + "'"
+    cmd = [ffmpeg, '-y', '-hide_banner', '-loglevel', 'error', '-i', str(video_path),
+           '-vf', subtitle_filter, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18',
+           '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', str(output_path)]
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if r.returncode != 0:
+        raise RuntimeError('Subtitle rendering failed.\n' + (r.stderr or 'Unknown FFmpeg error.')[-3000:])
+
+
+with video_editor_tab:
+    st.subheader('🎬 Video Subtitle Editor')
+    st.caption('Edit SRT subtitles with automatic wrapping and multilingual font rendering. Bilingual source/translation lines are preserved.')
+
+    c1, c2 = st.columns(2)
+    with c1:
+        editor_video = st.file_uploader('Upload video', type=SUPPORTED_TYPES, key='editor_final_video')
+    with c2:
+        editor_srt = st.file_uploader('Upload SRT subtitle', type=['srt'], key='editor_final_srt')
+
+    if editor_video and editor_srt:
+        srt_text = editor_srt.getvalue().decode('utf-8-sig', errors='replace')
+        state_key = f'{editor_srt.name}:{len(srt_text)}'
+        if st.session_state.get('editor_final_state_key') != state_key:
+            st.session_state.editor_final_segments = editor_parse_srt(srt_text)
+            st.session_state.editor_final_state_key = state_key
+
+        segments = st.session_state.get('editor_final_segments', [])
+        if not segments:
+            st.error('No valid subtitle cues were found in this SRT.')
+        else:
+            st.video(editor_video)
+            st.markdown(f'**{len(segments)} subtitle cues loaded**')
+
+            for index, cue in enumerate(segments):
+                with st.expander(f'Subtitle {index + 1} · {format_time(cue[0])}', expanded=(index == 0)):
+                    a, b = st.columns(2)
+                    with a:
+                        cue[0] = st.number_input('Start (seconds)', min_value=0.0, value=float(cue[0]), step=0.1, key=f'ef_s_{index}')
+                    with b:
+                        cue[1] = st.number_input('End (seconds)', min_value=0.0, value=float(cue[1]), step=0.1, key=f'ef_e_{index}')
+                    cue[2] = st.text_area('Subtitle text', value=cue[2], height=120, key=f'ef_t_{index}')
+
+            st.markdown('### 🎨 Subtitle style')
+            s1, s2, s3 = st.columns(3)
+            with s1:
+                font_name = st.selectbox('Base font', ['Noto Sans', 'Noto Sans CJK SC', 'DejaVu Sans', 'Liberation Sans'], index=0, key='ef_font')
+                font_size = st.slider('Font size', 18, 96, 42, key='ef_size')
+                text_color = st.color_picker('Text color', '#FFFFFF', key='ef_text_color')
+            with s2:
+                bold = st.checkbox('Bold', True, key='ef_bold')
+                italic = st.checkbox('Italic', False, key='ef_italic')
+                underline = st.checkbox('Underline', False, key='ef_under')
+                position = st.selectbox('Position', ['Bottom', 'Middle', 'Top'], index=0, key='ef_pos')
+                margin_v = st.slider('Vertical margin', 10, 240, 60, key='ef_margin')
+            with s3:
+                outline_width = st.slider('Outline width', 0, 8, 3, key='ef_outline')
+                outline_color = st.color_picker('Outline color', '#000000', key='ef_outline_color')
+                wrap_units = st.slider('Auto-wrap width', 18, 60, 34, key='ef_wrap')
+                st.caption('Original and translated lines wrap independently. Subtitle background remains transparent.')
+
+            if st.button('🎬 Render video', type='primary', key='ef_render'):
+                work_dir = Path(tempfile.mkdtemp(prefix='hinglish_editor_final_'))
+                try:
+                    video_path = work_dir / ('input' + (Path(editor_video.name).suffix.lower() or '.mp4'))
+                    ass_path = work_dir / 'subtitles.ass'
+                    output_path = work_dir / 'output.mp4'
+                    video_path.write_bytes(editor_video.getbuffer())
+                    ass_path.write_text(editor_build_ass(segments, font_name, font_size, text_color, bold, italic,
+                                                         underline, position, margin_v, outline_width,
+                                                         outline_color, wrap_units), encoding='utf-8')
+                    with st.spinner('Rendering subtitles into the video...'):
+                        editor_render_video(video_path, ass_path, output_path)
+                    st.success('Video rendered successfully.')
+                    st.video(str(output_path))
+                    st.download_button('⬇️ Download MP4', data=output_path.read_bytes(),
+                                       file_name=Path(editor_video.name).stem + '_subtitled.mp4',
+                                       mime='video/mp4', key='ef_download')
+                except Exception as exc:
+                    st.error(str(exc))
+          '''
+
+          text += editor
+          p.write_text(text, encoding='utf-8')
+
+          packages = Path('packages.txt')
+          existing = packages.read_text(encoding='utf-8').splitlines() if packages.exists() else []
+          required = ['ffmpeg', 'fontconfig', 'fonts-noto-cjk', 'fonts-noto-core', 'fonts-noto-extra', 'fonts-noto-mono', 'fonts-noto-color-emoji']
+          merged = []
+          for item in existing + required:
+              item = item.strip()
+              if item and item not in merged:
+                  merged.append(item)
+          packages.write_text('\n'.join(merged) + '\n', encoding='utf-8')
+          PY
+
+      - name: Syntax check
+        run: python -m py_compile app.py
+
+      - name: Commit final editor fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add app.py packages.txt .github/workflows/fix-editor-final.yml
+          git commit -m "fix: multilingual subtitle editor wrapping and fonts [editor-final]"
+          git push
