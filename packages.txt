@@ -1,1 +1,7 @@
 ffmpeg
+fontconfig
+fonts-noto-cjk
+fonts-noto-core
+fonts-noto-extra
+fonts-noto-mono
+fonts-noto-color-emoji
