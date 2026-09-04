@@ -271,7 +271,7 @@ if uploaded_file is not None:
                 model_load_seconds = time.time() - model_load_start
                 status.write(f"✅ Whisper {MODEL_SIZE} model loaded in {model_load_seconds:.1f}s.")
 
-                status.write("🔎 Recognition started. The progress bar below shows actual audio processed.")
+                status.write("🔎 Recognition started. Multilingual code-switch detection is enabled.")
                 progress = st.progress(0, text="Preparing recognition…")
                 progress_detail = st.empty()
                 preview_box = st.empty()
@@ -297,6 +297,9 @@ if uploaded_file is not None:
                     repetition_penalty=1.05,
                     no_repeat_ngram_size=3,
                     word_timestamps=False,
+                    multilingual=True,
+                    language_detection_threshold=0.5,
+                    language_detection_segments=1,
                 )
 
                 raw_segments = []
@@ -367,7 +370,8 @@ if uploaded_file is not None:
             language_probability = getattr(info, "language_probability", None)
             st.write(f"Detected language: **{detected_language}**")
             if language_probability is not None:
-                st.write(f"Language confidence: **{language_probability * 100:.1f}%**")
+                st.write(f"Initial language confidence: **{language_probability * 100:.1f}%**")
+            st.caption("Multilingual mode performs language detection during decoding, so English/Hindi code-switches can be handled independently instead of relying only on the first part of the video.")
             st.write(f"Subtitle segments: **{len(segment_list)}**")
             if media_duration is not None:
                 st.write(f"Final subtitle time: **{format_time(segment_list[-1][1])} / {format_time(media_duration)}**")
