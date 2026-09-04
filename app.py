@@ -271,7 +271,7 @@ if uploaded_file is not None:
                 model_load_seconds = time.time() - model_load_start
                 status.write(f"✅ Whisper {MODEL_SIZE} model loaded in {model_load_seconds:.1f}s.")
 
-                status.write("🔎 Recognition started. Multilingual code-switch detection is enabled.")
+                status.write("🔎 Recognition started. Hinglish-preserving transcription is enabled.")
                 progress = st.progress(0, text="Preparing recognition…")
                 progress_detail = st.empty()
                 preview_box = st.empty()
@@ -285,6 +285,12 @@ if uploaded_file is not None:
                     best_of=5,
                     patience=1,
                     temperature=(0.0, 0.2, 0.4),
+                    initial_prompt=(
+                        "This is natural Hinglish speech: Hindi and English are mixed in the same sentence. "
+                        "Keep Hindi words in Devanagari and keep English words, names, technical terms, "
+                        "and common English expressions in Latin/English script. Do not transliterate English "
+                        "words into Devanagari when the speaker is speaking English. Preserve natural code-switching."
+                    ),
                     vad_filter=True,
                     vad_parameters={
                         "min_silence_duration_ms": 1000,
@@ -297,9 +303,7 @@ if uploaded_file is not None:
                     repetition_penalty=1.05,
                     no_repeat_ngram_size=3,
                     word_timestamps=False,
-                    multilingual=True,
-                    language_detection_threshold=0.5,
-                    language_detection_segments=1,
+                    multilingual=False,
                 )
 
                 raw_segments = []
@@ -371,7 +375,7 @@ if uploaded_file is not None:
             st.write(f"Detected language: **{detected_language}**")
             if language_probability is not None:
                 st.write(f"Initial language confidence: **{language_probability * 100:.1f}%**")
-            st.caption("Multilingual mode performs language detection during decoding, so English/Hindi code-switches can be handled independently instead of relying only on the first part of the video.")
+            st.caption("Hinglish mode keeps Hindi in Devanagari while encouraging English words and expressions to remain in Latin script.")
             st.write(f"Subtitle segments: **{len(segment_list)}**")
             if media_duration is not None:
                 st.write(f"Final subtitle time: **{format_time(segment_list[-1][1])} / {format_time(media_duration)}**")
