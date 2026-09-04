@@ -347,9 +347,6 @@ with translation_tab:
 
 st.divider();st.caption("Hinglish Subtitle Studio · Whisper medium + FFmpeg + faster-whisper · AI: DeepSeek · Free translation: Google / LibreTranslate")
 
-
-st.set_page_config(page_title="Video Subtitle Editor", page_icon="🎬", layout="wide")
-
 SUPPORTED_VIDEO_TYPES = ["mp4", "mov", "mkv", "webm", "avi", "m4v"]
 FONT_OPTIONS = ["Noto Sans", "Noto Sans CJK SC", "Noto Sans CJK JP", "Noto Sans CJK KR", "Noto Sans Devanagari", "Noto Sans Arabic", "Noto Sans Thai", "Noto Sans Hebrew", "DejaVu Sans", "Liberation Sans", "Arial", "Helvetica"]
 POSITION_OPTIONS = {"Bottom": 2, "Middle": 5, "Top": 8}
@@ -376,18 +373,61 @@ def editor_parse_time(value):
 
 
 def editor_parse_srt(content):
-    content=content.replace("\r\n","\n").replace("\r","\n").strip(); blocks=re.split(r"\n\s*\n",content); result=[]
-    for block in blocks:
-        lines=block.splitlines()
-        if len(lines)<3: continue
-        timing_index=next((i for i,line in enumerate(lines) if "-->" in line),None)
-        if timing_index is None or timing_index+1>=len(lines): continue
+    # Robust SRT parser: timing lines define entries; blank lines and cue numbers are optional.
+    content=content.replace("\ufeff","").replace("\r\n","\n").replace("\r","\n")
+    lines=content.split("\n")
+    result=[]
+    i=0
+    timing_re=re.compile(r"^\s*(\d{1,3}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,3}:\d{2}:\d{2}[,.]\d{1,3})(?:\s+.*)?$")
+    while i<len(lines):
+        line=lines[i].strip()
+        if not line:
+            i+=1
+            continue
+        if "-->" not in line:
+            # Normal SRT cue number or harmless metadata.
+            i+=1
+            continue
+        match=timing_re.match(line)
+        if not match:
+            i+=1
+            continue
         try:
-            start_text,end_text=[x.strip().split()[0] for x in lines[timing_index].split("-->",1)]; start=editor_parse_time(start_text); end=editor_parse_time(end_text)
-        except Exception: continue
-        text="\n".join(x.rstrip() for x in lines[timing_index+1:]).strip()
-        if text and end>start: result.append({"start":start,"end":end,"text":text})
+            start=editor_parse_time(match.group(1)); end=editor_parse_time(match.group(2))
+        except ValueError:
+            i+=1
+            continue
+        i+=1
+        text_lines=[]
+        while i<len(lines):
+            current=lines[i]
+            if not current.strip():
+                i+=1
+                break
+            if timing_re.match(current.strip()):
+                break
+            text_lines.append(current.rstrip())
+            i+=1
+        text="\n".join(text_lines).strip()
+        if text and end>start:
+            result.append({"start":start,"end":end,"text":text})
     return result
+
+
+def editor_probe_video(path):
+    ffprobe=editor_find_binary("ffprobe")
+    if not ffprobe: return None
+    command=[ffprobe,"-v","error","-select_streams","v:0","-show_entries","stream=width,height,duration,r_frame_rate","-show_entries","format=duration","-of","default=noprint_wrappers=1",path]
+    result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    if result.returncode!=0:return None
+    info={}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key,value=line.split("=",1); info[key]=value
+    try:
+        info["width"]=int(info.get("width",0)); info["height"]=int(info.get("height",0)); info["duration"]=float(info.get("duration",0) or 0)
+    except ValueError:return None
+    return info
 
 
 def editor_ass_escape(text):
@@ -448,7 +488,7 @@ def editor_wrap_line(text,max_units):
 
 def editor_wrap_bilingual(text,max_units):
     physical_lines=str(text).replace("\r\n","\n").replace("\r","\n").split("\n")
-    return "\n".join(editor_wrap_line(line,max_units) for line in physical_lines if line.strip())
+    return "\n".join(editor_wrap_line(part,max_units) for part in physical_lines if part.strip())
 
 
 def editor_font_for_char(char,fallback):
@@ -475,18 +515,26 @@ def editor_ass_runs(text,base_font):
     return "".join("{\\fn"+editor_ass_escape(font)+"}"+editor_ass_escape(value) for font,value in parts)
 
 
-def editor_build_ass(subtitles,settings):
-    primary=editor_ass_color(settings["text_color"]); outline=editor_ass_color(settings["outline_color"]); font_name=settings["font"]; font_size=int(settings["font_size"]); bold=-1 if settings["bold"] else 0; italic=-1 if settings["italic"] else 0; underline=-1 if settings["underline"] else 0; alignment=POSITION_OPTIONS[settings["position"]]; margin_v=int(settings["margin_v"]); outline_width=int(settings["outline_width"]); max_units=int(settings["wrap_width"])
-    header=("[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nScaledBorderAndShadow: yes\nWrapStyle: 2\nCollisions: Normal\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"+f"Style: Default,{font_name},{font_size},{primary},&H00000000,{outline},&HFF000000,{bold},{italic},{underline},0,100,100,0,0,1,{outline_width},0,{alignment},90,90,{margin_v},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+def editor_build_ass(subtitles,settings,width,height,duration):
+    # ASS canvas follows the real video resolution so 720p/1080p/vertical videos render correctly.
+    canvas_w=max(320,int(width or 1920)); canvas_h=max(180,int(height or 1080)); scale=canvas_w/1920.0
+    font_name=settings["font"]; font_size=max(12,int(round(settings["font_size"]*scale))); margin_v=max(8,int(round(settings["margin_v"]*scale))); outline_width=max(0,int(round(settings["outline_width"]*scale)))
+    primary=editor_ass_color(settings["text_color"]); outline=editor_ass_color(settings["outline_color"]); bold=-1 if settings["bold"] else 0; italic=-1 if settings["italic"] else 0; underline=-1 if settings["underline"] else 0; alignment=POSITION_OPTIONS[settings["position"]]; max_units=int(settings["wrap_width"])
+    header=("[Script Info]\nScriptType: v4.00+\n"+f"PlayResX: {canvas_w}\nPlayResY: {canvas_h}\nScaledBorderAndShadow: yes\nWrapStyle: 2\nCollisions: Normal\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"+f"Style: Default,{font_name},{font_size},{primary},&H00000000,{outline},&HFF000000,{bold},{italic},{underline},0,100,100,0,0,1,{outline_width},0,{alignment},90,90,{margin_v},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     lines=[header]
     for item in subtitles:
+        start=max(0.0,float(item["start"])); end=max(start,float(item["end"]))
+        if duration>0:
+            if start>=duration: continue
+            end=min(end,duration)
+        if end<=start: continue
         text=editor_ass_runs(editor_wrap_bilingual(item["text"],max_units),font_name)
         if settings["text_color"]!=settings["base_text_color"]: text="{\\c"+editor_ass_color(settings["text_color"])+"}"+text
         if settings["bold"]: text="{\\b1}"+text
         if settings["italic"]: text="{\\i1}"+text
         if settings["underline"]: text="{\\u1}"+text
         text=text.replace("\n",r"\N")
-        lines.append(f"Dialogue: 0,{editor_ass_time(item['start'])},{editor_ass_time(item['end'])},Default,,0,0,0,,{text}")
+        lines.append(f"Dialogue: 0,{editor_ass_time(start)},{editor_ass_time(end)},Default,,0,0,0,,{text}")
     return "\n".join(lines)+"\n"
 
 
@@ -496,7 +544,7 @@ def editor_run_ffmpeg(video_path,ass_path,output_path):
     ass_filter_path=ass_path.replace("\\","/").replace(":",r"\:")
     video_filter="subtitles='"+ass_filter_path.replace("'",r"\'")+"'"
     env=os.environ.copy(); env.setdefault("FONTCONFIG_PATH","/etc/fonts"); env.setdefault("FONTCONFIG_FILE","/etc/fonts/fonts.conf")
-    command=[ffmpeg,"-y","-hide_banner","-loglevel","error","-i",video_path,"-vf",video_filter,"-c:v","libx264","-preset","veryfast","-crf","18","-c:a","aac","-b:a","192k","-movflags","+faststart",output_path]
+    command=[ffmpeg,"-y","-hide_banner","-loglevel","error","-i",video_path,"-map","0:v:0","-map","0:a:0?","-vf",video_filter,"-c:v","libx264","-preset","veryfast","-crf","18","-c:a","aac","-b:a","192k","-movflags","+faststart","-shortest",output_path]
     result=subprocess.run(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=env)
     if result.returncode!=0: raise RuntimeError((result.stderr or "FFmpeg subtitle rendering failed.")[-3000:])
 
@@ -508,41 +556,56 @@ with video_editor_tab:
     srt_file=st.file_uploader("Choose prepared SRT subtitle",type=["srt"],key="editor_srt")
     if video: st.video(video)
     if video and srt_file:
-        try: subtitles=editor_parse_srt(srt_file.getvalue().decode("utf-8-sig",errors="replace"))
-        except Exception as exc: subtitles=[]; st.error(f"Could not read subtitle file: {exc}")
-        if not subtitles: st.error("No valid subtitle entries were found in the SRT file.")
+        try:
+            subtitles=editor_parse_srt(srt_file.getvalue().decode("utf-8-sig",errors="replace"))
+        except Exception as exc:
+            subtitles=[]; st.error(f"Could not read subtitle file: {exc}")
+        if not subtitles:
+            st.error("No valid subtitle entries were found in the SRT file. Expected timestamps like 00:00:00,000 --> 00:00:03,000.")
         else:
-            st.success(f"Loaded {len(subtitles)} subtitle entries. You can edit the text and timing below.")
-            if "editor_subtitles" not in st.session_state or st.session_state.get("editor_source_name")!=srt_file.name: st.session_state.editor_subtitles=subtitles; st.session_state.editor_source_name=srt_file.name
-            edited=[]; st.subheader("✏️ Subtitle editing")
-            for i,item in enumerate(st.session_state.editor_subtitles,1):
-                with st.expander(f"#{i} · {editor_format_time(item['start'])} → {editor_format_time(item['end'])}",expanded=(i==1)):
-                    a,b=st.columns(2); start_text=a.text_input("Start",editor_format_time(item["start"]),key=f"start_{i}"); end_text=b.text_input("End",editor_format_time(item["end"]),key=f"end_{i}"); text=st.text_area("Subtitle text",item["text"],height=110,key=f"text_{i}")
+            work_probe_dir=tempfile.mkdtemp(prefix="editor_probe_")
+            probe_path=os.path.join(work_probe_dir,"probe"+Path(video.name).suffix.lower())
+            try:
+                with open(probe_path,"wb") as f:f.write(video.getbuffer())
+                video_info=editor_probe_video(probe_path)
+            finally:
+                shutil.rmtree(work_probe_dir,ignore_errors=True)
+            if not video_info:
+                st.error("Unable to read the video dimensions. Please check that the video contains a valid video stream.")
+            else:
+                st.success(f"Loaded {len(subtitles)} subtitle entries · video {video_info['width']}×{video_info['height']} · {video_info.get('duration',0):.2f}s")
+                source_signature=f"{srt_file.name}:{len(srt_file.getvalue())}:{hash(srt_file.getvalue())}"
+                if "editor_subtitles" not in st.session_state or st.session_state.get("editor_source_signature")!=source_signature:
+                    st.session_state.editor_subtitles=subtitles; st.session_state.editor_source_signature=source_signature
+                edited=[]; st.subheader("✏️ Subtitle editing")
+                for i,item in enumerate(st.session_state.editor_subtitles,1):
+                    with st.expander(f"#{i} · {editor_format_time(item['start'])} → {editor_format_time(item['end'])}",expanded=(i==1)):
+                        a,b=st.columns(2); start_text=a.text_input("Start",editor_format_time(item["start"]),key=f"start_{i}"); end_text=b.text_input("End",editor_format_time(item["end"]),key=f"end_{i}"); text=st.text_area("Subtitle text",item["text"],height=110,key=f"text_{i}")
+                        try:
+                            start=editor_parse_time(start_text); end=editor_parse_time(end_text)
+                            if end<=start: st.warning("End time must be later than start time.")
+                        except ValueError as exc: start,end=item["start"],item["end"]; st.warning(str(exc))
+                        edited.append({"start":start,"end":end,"text":text.strip() or item["text"]})
+                st.session_state.editor_subtitles=edited
+                st.subheader("🎨 Subtitle style"); c1,c2,c3=st.columns(3)
+                with c1:
+                    font=st.selectbox("Font",FONT_OPTIONS,index=0); font_size=st.slider("Font size",18,96,42,2); text_color=st.color_picker("Text color","#FFFFFF")
+                with c2:
+                    bold=st.checkbox("Bold",value=True); italic=st.checkbox("Italic",value=False); underline=st.checkbox("Underline",value=False); wrap_width=st.slider("Auto-wrap width",20,90,46,2,help="Approximate display width. Lower values create shorter subtitle lines."); highlight=st.checkbox("Text highlight",value=False,help="Changes text color only; the subtitle background remains transparent."); highlight_color=st.color_picker("Highlight color","#FFD84D",disabled=not highlight)
+                with c3:
+                    position=st.selectbox("Position",list(POSITION_OPTIONS.keys()),index=0); margin_v=st.slider("Vertical margin",20,180,55,5); outline_width=st.slider("Text outline",0,8,2,1); outline_color=st.color_picker("Outline color","#000000")
+                st.caption("Automatic wrapping is applied separately to each physical SRT line, so bilingual subtitles stay as Source + Translation.")
+                settings={"font":font,"font_size":font_size,"text_color":highlight_color if highlight else text_color,"base_text_color":text_color,"outline_color":outline_color,"outline_width":outline_width,"bold":bold,"italic":italic,"underline":underline,"position":position,"margin_v":margin_v,"wrap_width":wrap_width}
+                st.subheader("🔍 Final preview"); preview_text="\n".join(x["text"] for x in edited[:8] if x["text"]); st.text_area("Edited subtitle preview",preview_text,height=200,disabled=True)
+                if st.button("🎬 Burn subtitles into video",type="primary",use_container_width=True):
+                    work_dir=tempfile.mkdtemp(prefix="subtitle_editor_")
                     try:
-                        start=editor_parse_time(start_text); end=editor_parse_time(end_text)
-                        if end<=start: st.warning("End time must be later than start time.")
-                    except ValueError as exc: start,end=item["start"],item["end"]; st.warning(str(exc))
-                    edited.append({"start":start,"end":end,"text":text.strip() or item["text"]})
-            st.session_state.editor_subtitles=edited
-            st.subheader("🎨 Subtitle style"); c1,c2,c3=st.columns(3)
-            with c1:
-                font=st.selectbox("Font",FONT_OPTIONS,index=0); font_size=st.slider("Font size",18,96,42,2); text_color=st.color_picker("Text color","#FFFFFF")
-            with c2:
-                bold=st.checkbox("Bold",value=True); italic=st.checkbox("Italic",value=False); underline=st.checkbox("Underline",value=False); wrap_width=st.slider("Auto-wrap width",20,90,46,2,help="Approximate display width. Lower values create shorter subtitle lines."); highlight=st.checkbox("Text highlight",value=False,help="Changes text color only; the subtitle background remains transparent."); highlight_color=st.color_picker("Highlight color","#FFD84D",disabled=not highlight)
-            with c3:
-                position=st.selectbox("Position",list(POSITION_OPTIONS.keys()),index=0); margin_v=st.slider("Vertical margin",20,180,55,5); outline_width=st.slider("Text outline",0,8,2,1); outline_color=st.color_picker("Outline color","#000000")
-            st.caption("Automatic wrapping is applied separately to each physical SRT line, so bilingual subtitles stay as Source + Translation.")
-            settings={"font":font,"font_size":font_size,"text_color":highlight_color if highlight else text_color,"base_text_color":text_color,"outline_color":outline_color,"outline_width":outline_width,"bold":bold,"italic":italic,"underline":underline,"position":position,"margin_v":margin_v,"wrap_width":wrap_width}
-            st.subheader("🔍 Final preview"); preview_text="\n".join(x["text"] for x in edited[:8] if x["text"]); st.text_area("Edited subtitle preview",preview_text,height=200,disabled=True)
-            if st.button("🎬 Burn subtitles into video",type="primary",use_container_width=True):
-                work_dir=tempfile.mkdtemp(prefix="subtitle_editor_")
-                try:
-                    suffix=Path(video.name).suffix.lower() or ".mp4"; input_path=os.path.join(work_dir,"input"+suffix); ass_path=os.path.join(work_dir,"subtitles.ass"); output_path=os.path.join(work_dir,"subtitle_video.mp4")
-                    with open(input_path,"wb") as f: f.write(video.getbuffer())
-                    with open(ass_path,"w",encoding="utf-8") as f: f.write(editor_build_ass(edited,settings))
-                    progress=st.progress(0,text="Preparing video editor…"); progress.progress(.2,text="Parsing multilingual fonts and subtitle lines…"); progress.progress(.35,text="Rendering transparent-background subtitles…"); editor_run_ffmpeg(input_path,ass_path,output_path); progress.progress(1.0,text="Video rendering completed.")
-                    with open(output_path,"rb") as f: rendered=f.read()
-                    st.success("🎉 Subtitle video is ready."); st.video(rendered); st.download_button("⬇️ Download edited video",rendered,"subtitle_edited_video.mp4","video/mp4",use_container_width=True)
-                except Exception as exc: st.error(f"Video rendering failed: {exc}")
-                finally: shutil.rmtree(work_dir,ignore_errors=True)
+                        suffix=Path(video.name).suffix.lower() or ".mp4"; input_path=os.path.join(work_dir,"input"+suffix); ass_path=os.path.join(work_dir,"subtitles.ass"); output_path=os.path.join(work_dir,"subtitle_video.mp4")
+                        with open(input_path,"wb") as f: f.write(video.getbuffer())
+                        with open(ass_path,"w",encoding="utf-8") as f: f.write(editor_build_ass(edited,settings,video_info["width"],video_info["height"],video_info.get("duration",0)))
+                        progress=st.progress(0,text="Preparing video editor…"); progress.progress(.2,text="Parsing multilingual fonts and subtitle lines…"); progress.progress(.35,text="Rendering subtitles at the source video resolution…"); editor_run_ffmpeg(input_path,ass_path,output_path); progress.progress(1.0,text="Video rendering completed.")
+                        with open(output_path,"rb") as f: rendered=f.read()
+                        st.success("🎉 Subtitle video is ready."); st.video(rendered); st.download_button("⬇️ Download edited video",rendered,"subtitle_edited_video.mp4","video/mp4",use_container_width=True)
+                    except Exception as exc: st.error(f"Video rendering failed: {exc}")
+                    finally: shutil.rmtree(work_dir,ignore_errors=True)
     else: st.info("Upload both the original video and a prepared SRT file to start editing.")
