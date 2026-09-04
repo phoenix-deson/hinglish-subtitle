@@ -516,8 +516,11 @@ def editor_ass_runs(text,base_font):
 def editor_build_ass(subtitles,settings,width,height,duration):
     canvas_w=max(320,int(width or 1920)); canvas_h=max(180,int(height or 1080)); scale=canvas_w/1920.0
     font_name=settings["font"]; font_size=max(12,int(round(settings["font_size"]*scale))); margin_v=max(8,int(round(settings["margin_v"]*scale))); outline_width=max(0,int(round(settings["outline_width"]*scale)))
-    primary=editor_ass_color(settings["text_color"]); outline=editor_ass_color(settings["outline_color"]); bold=-1 if settings["bold"] else 0; italic=-1 if settings["italic"] else 0; underline=-1 if settings["underline"] else 0; alignment=POSITION_OPTIONS[settings["position"]]; max_units=int(settings["wrap_width"])
-    header=("[Script Info]\nScriptType: v4.00+\n"+f"PlayResX: {canvas_w}\nPlayResY: {canvas_h}\nScaledBorderAndShadow: yes\nWrapStyle: 2\nCollisions: Normal\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"+f"Style: Default,{font_name},{font_size},{primary},&H00000000,{outline},&HFF000000,{bold},{italic},{underline},0,100,100,0,0,1,{outline_width},0,{alignment},90,90,{margin_v},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    primary=editor_ass_color(settings["text_color"]); outline=editor_ass_color(settings["outline_color"]); bold=-1 if settings["bold"] else 0; italic=-1 if settings["italic"] else 0; underline=-1 if settings["underline"] else 0; alignment=POSITION_OPTIONS[settings["position"]]
+    # Keep each subtitle within approximately 80% of the actual video width.
+    # Convert that pixel width to the same font-unit scale used by the wrapping estimator.
+    subtitle_width_percent=float(settings.get("width_percent",80)); max_units=max(10,int((canvas_w*(subtitle_width_percent/100.0))/max(font_size,1)))
+    header=("[Script Info]\nScriptType: v4.00+\n"+f"PlayResX: {canvas_w}\nPlayResY: {canvas_h}\nScaledBorderAndShadow: yes\nWrapStyle: 2\nCollisions: Normal\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"+f"Style: Default,{font_name},{font_size},{primary},&H00000000,{outline},&HFF000000,{bold},{italic},{underline},0,100,100,0,0,1,{outline_width},0,{alignment},{int(canvas_w*0.1)},{int(canvas_w*0.1)},{margin_v},1\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     lines=[header]
     for item in subtitles:
         start=max(0.0,float(item["start"])); end=max(start,float(item["end"]))
@@ -588,11 +591,12 @@ with video_editor_tab:
                 with c1:
                     font=st.selectbox("Font",FONT_OPTIONS,index=0); font_size=st.slider("Font size",18,96,42,2); text_color=st.color_picker("Text color","#FFFFFF")
                 with c2:
-                    bold=st.checkbox("Bold",value=True); italic=st.checkbox("Italic",value=False); underline=st.checkbox("Underline",value=False); wrap_width=st.slider("Auto-wrap width",20,90,46,2,help="Approximate display width. Lower values create shorter subtitle lines."); highlight=st.checkbox("Text highlight",value=False,help="Changes text color only; the subtitle background remains transparent."); highlight_color=st.color_picker("Highlight color","#FFD84D",disabled=not highlight)
+                    bold=st.checkbox("Bold",value=True); italic=st.checkbox("Italic",value=False); underline=st.checkbox("Underline",value=False); highlight=st.checkbox("Text highlight",value=False,help="Changes text color only; the subtitle background remains transparent."); highlight_color=st.color_picker("Highlight color","#FFD84D",disabled=not highlight)
+                    width_percent=st.slider("Subtitle width",50,90,80,5,format="%d%%",help="Long subtitles are allowed to use approximately this percentage of the actual video width before automatic wrapping.")
                 with c3:
                     position=st.selectbox("Position",list(POSITION_OPTIONS.keys()),index=0); margin_v=st.slider("Vertical margin",20,180,55,5); outline_width=st.slider("Text outline",0,8,2,1); outline_color=st.color_picker("Outline color","#000000")
-                st.caption("Automatic wrapping is applied separately to each physical SRT line, so bilingual subtitles stay as Source + Translation.")
-                settings={"font":font,"font_size":font_size,"text_color":highlight_color if highlight else text_color,"base_text_color":text_color,"outline_color":outline_color,"outline_width":outline_width,"bold":bold,"italic":italic,"underline":underline,"position":position,"margin_v":margin_v,"wrap_width":wrap_width}
+                st.caption("Long subtitles adapt to the actual video width. Default is 80%, centered in the video; bilingual SRT lines remain Source + Translation.")
+                settings={"font":font,"font_size":font_size,"text_color":highlight_color if highlight else text_color,"base_text_color":text_color,"outline_color":outline_color,"outline_width":outline_width,"bold":bold,"italic":italic,"underline":underline,"position":position,"margin_v":margin_v,"width_percent":width_percent}
                 st.subheader("🔍 Final preview"); preview_text="\n".join(x["text"] for x in edited[:8] if x["text"]); st.text_area("Edited subtitle preview",preview_text,height=200,disabled=True)
                 if st.button("🎬 Burn subtitles into video",type="primary",use_container_width=True):
                     work_dir=tempfile.mkdtemp(prefix="subtitle_editor_")
