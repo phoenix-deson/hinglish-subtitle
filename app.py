@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -165,12 +166,9 @@ def filter_hallucinations(raw_segments, media_duration=None):
         no_speech_prob = float(getattr(segment, "no_speech_prob", 0.0))
         compression_ratio = float(getattr(segment, "compression_ratio", 0.0))
 
-        # Whisper's own failure signals. A segment is treated as silence only
-        # when both no-speech probability and log probability indicate failure.
         if no_speech_prob >= 0.75 and avg_logprob < -0.8:
             continue
 
-        # Extremely repetitive output is a classic end-of-audio hallucination.
         normalized = normalize_for_comparison(text)
         if normalized:
             similarity = SequenceMatcher(None, normalized, last_normalized).ratio()
@@ -181,11 +179,8 @@ def filter_hallucinations(raw_segments, media_duration=None):
             last_normalized = normalized
 
             if repeat_streak >= 2:
-                # Stop processing after three nearly identical consecutive
-                # segments instead of allowing Whisper to hallucinate forever.
                 break
 
-        # High compression is another strong hallucination indicator.
         if compression_ratio >= 3.0 and len(normalized) > 20:
             continue
 
@@ -194,7 +189,6 @@ def filter_hallucinations(raw_segments, media_duration=None):
         if len(recent_texts) > 5:
             recent_texts.pop(0)
 
-    # A repeated final segment can still enter accepted before the streak ends.
     if len(accepted) >= 3:
         cleaned = []
         for item in accepted:
@@ -272,9 +266,17 @@ if uploaded_file is not None:
                     pass
 
                 status.write(f"🧠 Loading multilingual Whisper {MODEL_SIZE} model…")
+                model_load_start = time.time()
                 model = load_model()
+                model_load_seconds = time.time() - model_load_start
+                status.write(f"✅ Whisper {MODEL_SIZE} model loaded in {model_load_seconds:.1f}s.")
 
-                status.write("🔎 Recognizing Hindi + English mixed speech with hallucination protection…")
+                status.write("🔎 Recognition started. The progress bar below shows actual audio processed.")
+                progress = st.progress(0, text="Preparing recognition…")
+                progress_detail = st.empty()
+                preview_box = st.empty()
+
+                recognition_start = time.time()
                 segments, info = model.transcribe(
                     wav_path,
                     language=None,
@@ -294,11 +296,51 @@ if uploaded_file is not None:
                     no_speech_threshold=0.6,
                     repetition_penalty=1.05,
                     no_repeat_ngram_size=3,
-                    word_timestamps=True,
-                    hallucination_silence_threshold=2.0,
+                    word_timestamps=False,
                 )
 
-                raw_segments = list(segments)
+                raw_segments = []
+                last_ui_update = 0.0
+                last_preview_update = 0.0
+
+                for segment in segments:
+                    raw_segments.append(segment)
+
+                    now = time.time()
+                    current_end = max(0.0, float(segment.end))
+                    elapsed = now - recognition_start
+
+                    if media_duration:
+                        ratio = min(1.0, current_end / media_duration)
+                        progress.progress(
+                            ratio,
+                            text=f"Recognizing… {format_time(current_end)} / {format_time(media_duration)} ({ratio * 100:.1f}%)",
+                        )
+                    else:
+                        progress.progress(
+                            min(0.99, len(raw_segments) / max(1, len(raw_segments) + 20)),
+                            text=f"Recognizing… {format_time(current_end)} processed",
+                        )
+
+                    if now - last_ui_update >= 2.0:
+                        speed = current_end / elapsed if elapsed > 0 else 0
+                        eta = ((media_duration - current_end) / speed) if media_duration and speed > 0 else None
+                        eta_text = f" · ETA ~{int(eta // 60)}m {int(eta % 60)}s" if eta is not None else ""
+                        progress_detail.info(
+                            f"🎙️ Processed **{format_time(current_end)}** of **{format_time(media_duration) if media_duration else 'unknown'}** · "
+                            f"{len(raw_segments)} segments · {speed:.2f}× real-time{eta_text}"
+                        )
+                        last_ui_update = now
+
+                    if now - last_preview_update >= 4.0:
+                        preview_text = clean_text(segment.text)
+                        if preview_text:
+                            preview_box.caption(f"Latest recognition: {preview_text}")
+                        last_preview_update = now
+
+                progress.progress(1.0, text="Recognition finished. Validating transcript…")
+                progress_detail.info(f"✅ Whisper returned {len(raw_segments)} raw segments. Running hallucination and timestamp checks…")
+
                 segment_list = filter_hallucinations(raw_segments, media_duration)
 
                 if not segment_list:
