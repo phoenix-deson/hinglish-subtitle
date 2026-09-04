@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import streamlit as st
@@ -20,7 +21,7 @@ CPU_THREADS = max(1, min(2, os.cpu_count() or 2))
 
 st.title("🎬 Hinglish Subtitle Studio")
 st.write("High-accuracy English + Hindi mixed speech subtitle generator")
-st.caption("Video → FFmpeg WAV → multilingual Whisper → time-aligned SRT/TXT")
+st.caption("Video → FFmpeg WAV → multilingual Whisper → hallucination-safe SRT/TXT")
 
 
 def find_binary(name):
@@ -58,6 +59,11 @@ def load_model():
 
 def clean_text(text):
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def normalize_for_comparison(text):
+    text = clean_text(text).lower()
+    return re.sub(r"[^\w\u0900-\u097f]+", "", text)
 
 
 def format_time(seconds):
@@ -132,11 +138,14 @@ def extract_wav(video_path, wav_path):
         raise RuntimeError("The video does not contain a readable audio track.")
 
 
-def normalize_segments(segments, media_duration=None):
-    normalized = []
-    previous_end = 0.0
+def filter_hallucinations(raw_segments, media_duration=None):
+    """Remove Whisper failure loops, obvious silence hallucinations and bad timestamps."""
+    accepted = []
+    recent_texts = []
+    repeat_streak = 0
+    last_normalized = ""
 
-    for segment in segments:
+    for segment in raw_segments:
         text = clean_text(segment.text)
         if not text:
             continue
@@ -152,17 +161,52 @@ def normalize_segments(segments, media_duration=None):
         if end <= start:
             continue
 
-        # Protect against rare timestamp regressions from ASR output.
-        if start < previous_end - 0.5:
-            start = previous_end
+        avg_logprob = float(getattr(segment, "avg_logprob", 0.0))
+        no_speech_prob = float(getattr(segment, "no_speech_prob", 0.0))
+        compression_ratio = float(getattr(segment, "compression_ratio", 0.0))
 
-        if end <= start:
+        # Whisper's own failure signals. A segment is treated as silence only
+        # when both no-speech probability and log probability indicate failure.
+        if no_speech_prob >= 0.75 and avg_logprob < -0.8:
             continue
 
-        normalized.append((start, end, text))
-        previous_end = end
+        # Extremely repetitive output is a classic end-of-audio hallucination.
+        normalized = normalize_for_comparison(text)
+        if normalized:
+            similarity = SequenceMatcher(None, normalized, last_normalized).ratio()
+            if normalized == last_normalized or similarity >= 0.92:
+                repeat_streak += 1
+            else:
+                repeat_streak = 0
+            last_normalized = normalized
 
-    return normalized
+            if repeat_streak >= 2:
+                # Stop processing after three nearly identical consecutive
+                # segments instead of allowing Whisper to hallucinate forever.
+                break
+
+        # High compression is another strong hallucination indicator.
+        if compression_ratio >= 3.0 and len(normalized) > 20:
+            continue
+
+        accepted.append((start, end, text))
+        recent_texts.append(normalized)
+        if len(recent_texts) > 5:
+            recent_texts.pop(0)
+
+    # A repeated final segment can still enter accepted before the streak ends.
+    if len(accepted) >= 3:
+        cleaned = []
+        for item in accepted:
+            if cleaned:
+                previous = normalize_for_comparison(cleaned[-1][2])
+                current = normalize_for_comparison(item[2])
+                if current and previous and SequenceMatcher(None, previous, current).ratio() >= 0.92:
+                    continue
+            cleaned.append(item)
+        accepted = cleaned
+
+    return accepted
 
 
 def make_srt(segments):
@@ -216,11 +260,11 @@ if uploaded_file is not None:
                 if media_duration is not None:
                     status.write(f"⏱️ Video duration: {format_time(media_duration)}")
                 else:
-                    status.write("⏱️ Video duration could not be read; subtitle timestamps will still be validated when possible.")
+                    status.write("⏱️ Video duration could not be read; final timestamps will still be protected when possible.")
 
                 status.write("🎵 Extracting 16 kHz mono PCM WAV with FFmpeg…")
                 extract_wav(video_path, wav_path)
-                status.write("✅ Lossless temporary WAV extraction completed.")
+                status.write("✅ WAV extraction completed.")
 
                 try:
                     os.remove(video_path)
@@ -230,7 +274,7 @@ if uploaded_file is not None:
                 status.write(f"🧠 Loading multilingual Whisper {MODEL_SIZE} model…")
                 model = load_model()
 
-                status.write("🔎 Recognizing Hindi + English mixed speech…")
+                status.write("🔎 Recognizing Hindi + English mixed speech with hallucination protection…")
                 segments, info = model.transcribe(
                     wav_path,
                     language=None,
@@ -238,36 +282,42 @@ if uploaded_file is not None:
                     beam_size=5,
                     best_of=5,
                     patience=1,
+                    temperature=(0.0, 0.2, 0.4),
                     vad_filter=True,
                     vad_parameters={
                         "min_silence_duration_ms": 1000,
                         "speech_pad_ms": 400,
                     },
                     condition_on_previous_text=False,
-                    temperature=0.0,
                     compression_ratio_threshold=2.4,
                     log_prob_threshold=-1.0,
-                    no_speech_threshold=0.5,
-                    initial_prompt=(
-                        "This is Hinglish speech, a natural mixture of Hindi and English. "
-                        "Keep English words in English and Hindi speech in Devanagari when recognized."
-                    ),
+                    no_speech_threshold=0.6,
+                    repetition_penalty=1.05,
+                    no_repeat_ngram_size=3,
+                    word_timestamps=True,
+                    hallucination_silence_threshold=2.0,
                 )
 
                 raw_segments = list(segments)
-                segment_list = normalize_segments(raw_segments, media_duration)
+                segment_list = filter_hallucinations(raw_segments, media_duration)
 
                 if not segment_list:
-                    raise RuntimeError("No speech was detected in the uploaded video.")
+                    raise RuntimeError("No reliable speech was detected in the uploaded video.")
 
                 if media_duration is not None:
-                    last_end = segment_list[-1][1]
-                    if last_end > media_duration:
-                        status.write("🛡️ Final subtitle timestamps were clipped to the real video duration.")
+                    segment_list = [
+                        (start, min(end, media_duration), text)
+                        for start, end, text in segment_list
+                        if start < media_duration
+                    ]
+
+                if not segment_list:
+                    raise RuntimeError("No reliable subtitle segments remain after validation.")
 
                 srt_content = make_srt(segment_list)
                 txt_content = make_txt(segment_list)
 
+                status.write(f"🛡️ Removed/blocked {max(0, len(raw_segments) - len(segment_list))} unreliable or repeated segments.")
                 status.update(label="✅ High-accuracy subtitle generation completed", state="complete")
 
             st.success("🎉 Done!")
