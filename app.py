@@ -18,16 +18,22 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Recognition is intentionally frozen in this version.
 MODEL_SIZE = "medium"
 SUPPORTED_TYPES = ["mp4", "mov", "mkv", "webm", "avi", "m4v"]
 CPU_THREADS = max(1, min(2, os.cpu_count() or 2))
-TRANSLATE_ENDPOINTS = [
+
+# Translation is independent from recognition. Free public services are tried in order.
+# Google GTX is used as the first lightweight engine; LibreTranslate and MyMemory are fallbacks.
+TRANSLATION_ENGINES = ["Google Translate", "LibreTranslate", "MyMemory"]
+LIBRETRANSLATE_ENDPOINTS = [
     "https://translate.argosopentech.com",
     "https://translate.terraprint.co",
     "https://lt.vern.cc",
 ]
 TARGET_LANGUAGES = {
-    "Simplified Chinese": "zh",
+    "Simplified Chinese": "zh-CN",
+    "Traditional Chinese": "zh-TW",
     "English": "en",
     "Japanese": "ja",
     "Korean": "ko",
@@ -39,20 +45,32 @@ TARGET_LANGUAGES = {
     "Arabic": "ar",
     "Indonesian": "id",
     "Hindi": "hi",
+    "Italian": "it",
+    "Turkish": "tr",
+    "Vietnamese": "vi",
+    "Thai": "th",
+}
+
+LANGUAGE_NAMES = {
+    "en": "English", "hi": "Hindi", "zh": "Chinese", "zh-CN": "Simplified Chinese",
+    "zh-TW": "Traditional Chinese", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
+    "fr": "French", "de": "German", "pt": "Portuguese", "ru": "Russian", "ar": "Arabic",
+    "id": "Indonesian", "it": "Italian", "tr": "Turkish", "vi": "Vietnamese", "th": "Thai",
 }
 
 st.markdown(
     """
     <style>
-    .hero { padding: 1.2rem 1.4rem; border-radius: 18px; border: 1px solid rgba(128,128,128,.25); margin-bottom: 1rem; }
-    .hero h1 { margin: 0; font-size: 2.1rem; }
-    .hero p { margin: .35rem 0 0; opacity: .75; }
-    .feature { padding: .9rem 1rem; border-radius: 14px; border: 1px solid rgba(128,128,128,.2); min-height: 90px; }
-    .feature b { font-size: 1.05rem; }
+    .hero { padding: 1.4rem 1.6rem; border-radius: 20px; border: 1px solid rgba(128,128,128,.22); margin-bottom: 1rem; background: linear-gradient(135deg, rgba(128,128,128,.10), rgba(128,128,128,.03)); }
+    .hero h1 { margin: 0; font-size: 2.25rem; letter-spacing: -.02em; }
+    .hero p { margin: .4rem 0 0; opacity: .72; font-size: 1.02rem; }
+    .feature { padding: 1rem 1.05rem; border-radius: 16px; border: 1px solid rgba(128,128,128,.18); min-height: 92px; background: rgba(128,128,128,.035); }
+    .feature b { font-size: 1.03rem; }
+    .mini-note { opacity: .68; font-size: .88rem; }
     </style>
     <div class="hero">
       <h1>🎬 Hinglish Subtitle Studio</h1>
-      <p>Accurate Hinglish transcription + free multilingual subtitle translation</p>
+      <p>Accurate Hinglish transcription · multilingual translation · clean subtitle export</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -61,11 +79,8 @@ st.markdown(
 
 def find_binary(name):
     candidates = [
-        shutil.which(name),
-        f"/usr/bin/{name}",
-        f"/usr/local/bin/{name}",
-        f"/opt/homebrew/bin/{name}",
-        f"/opt/conda/bin/{name}",
+        shutil.which(name), f"/usr/bin/{name}", f"/usr/local/bin/{name}",
+        f"/opt/homebrew/bin/{name}", f"/opt/conda/bin/{name}",
     ]
     for path in candidates:
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
@@ -84,11 +99,8 @@ def find_ffprobe():
 @st.cache_resource(show_spinner=False)
 def load_model():
     return WhisperModel(
-        MODEL_SIZE,
-        device="cpu",
-        compute_type="int8",
-        cpu_threads=CPU_THREADS,
-        num_workers=1,
+        MODEL_SIZE, device="cpu", compute_type="int8",
+        cpu_threads=CPU_THREADS, num_workers=1,
     )
 
 
@@ -142,29 +154,36 @@ def parse_srt(content):
 def make_srt(segments):
     lines = []
     for index, (start, end, text) in enumerate(segments, start=1):
+        lines.append(f"{index}\n{format_time(start)} --> {format_time(end)}\n{text}\n")
+    return "\n".join(lines)
+
+
+def make_bilingual_srt(source_segments, translated_segments):
+    lines = []
+    for index, ((start, end, source), (_, _, translated)) in enumerate(zip(source_segments, translated_segments), start=1):
         lines.append(
-            f"{index}\n"
-            f"{format_time(start)} --> {format_time(end)}\n"
-            f"{text}\n"
+            f"{index}\n{format_time(start)} --> {format_time(end)}\n"
+            f"{source}\n{translated}\n"
         )
     return "\n".join(lines)
 
 
 def make_txt(segments):
-    return "\n".join(
-        f"[{format_time(start)} --> {format_time(end)}] {text}"
-        for start, end, text in segments
-    )
+    return "\n".join(f"[{format_time(start)} --> {format_time(end)}] {text}" for start, end, text in segments)
+
+
+def make_bilingual_txt(source_segments, translated_segments):
+    lines = []
+    for (start, end, source), (_, _, translated) in zip(source_segments, translated_segments):
+        lines.append(f"[{format_time(start)} --> {format_time(end)}]\n{source}\n{translated}\n")
+    return "\n".join(lines)
 
 
 def get_media_duration(media_path):
     ffprobe = find_ffprobe()
     if not ffprobe:
         return None
-    command = [
-        ffprobe, "-v", "error", "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1", str(media_path),
-    ]
+    command = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(media_path)]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         return None
@@ -179,10 +198,7 @@ def extract_wav(video_path, wav_path):
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise RuntimeError("FFmpeg was not found on the server. Make sure packages.txt contains ffmpeg and redeploy.")
-    command = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path),
-        "-vn", "-map", "0:a:0?", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav_path),
-    ]
+    command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video_path), "-vn", "-map", "0:a:0?", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav_path)]
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         detail = (result.stderr or "").strip()
@@ -242,73 +258,6 @@ def filter_hallucinations(raw_segments, media_duration=None):
     return accepted
 
 
-def detect_script_language(text):
-    """Lightweight fallback when the online detector is unavailable."""
-    devanagari = len(re.findall(r"[\u0900-\u097f]", text))
-    latin = len(re.findall(r"[A-Za-z]", text))
-    if devanagari > latin * 1.2:
-        return "hi"
-    if latin > 0:
-        return "en"
-    return "unknown"
-
-
-def detect_language(text):
-    sample = clean_text(text)[:1800]
-    if not sample:
-        return "unknown", 0.0
-    for endpoint in TRANSLATE_ENDPOINTS:
-        try:
-            response = requests.post(
-                endpoint + "/detect",
-                data={"q": sample},
-                timeout=12,
-            )
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data, list) and data:
-                best = max(data, key=lambda item: float(item.get("confidence", 0)))
-                return best.get("language", "unknown"), float(best.get("confidence", 0))
-        except Exception:
-            continue
-    return detect_script_language(sample), 0.0
-
-
-def translate_text(text, target_language):
-    text = clean_text(text)
-    if not text:
-        return ""
-    last_error = None
-    for endpoint in TRANSLATE_ENDPOINTS:
-        try:
-            response = requests.post(
-                endpoint + "/translate",
-                data={"q": text[:5000], "source": "auto", "target": target_language, "format": "text"},
-                timeout=30,
-            )
-            response.raise_for_status()
-            data = response.json()
-            translated = clean_text(data.get("translatedText", ""))
-            if translated:
-                return translated
-            last_error = "Empty translation returned"
-        except Exception as error:
-            last_error = error
-    raise RuntimeError(str(last_error or "All free translation servers failed."))
-
-
-def translate_segments(segments, target_language, progress_callback=None):
-    translated = []
-    total = len(segments)
-    for index, (start, end, text) in enumerate(segments, start=1):
-        translated_text = translate_text(text, target_language)
-        translated.append((start, end, translated_text))
-        if progress_callback:
-            progress_callback(index, total, translated_text)
-        time.sleep(0.15)
-    return translated
-
-
 def recognition_pipeline(uploaded_file):
     suffix = Path(uploaded_file.name).suffix.lower()
     work_dir = tempfile.mkdtemp(prefix="hinglish_")
@@ -351,11 +300,7 @@ def recognition_pipeline(uploaded_file):
             yield "segment", segment, media_duration, info, len(raw_segments)
         segment_list = filter_hallucinations(raw_segments, media_duration)
         if media_duration is not None:
-            segment_list = [
-                (start, min(end, media_duration), text)
-                for start, end, text in segment_list
-                if start < media_duration
-            ]
+            segment_list = [(start, min(end, media_duration), text) for start, end, text in segment_list if start < media_duration]
         if not segment_list:
             raise RuntimeError("No reliable speech was detected in the uploaded video.")
         yield "done", segment_list, media_duration, info, len(raw_segments)
@@ -363,16 +308,144 @@ def recognition_pipeline(uploaded_file):
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+# ---------- Translation ----------
+# Language detection is performed per subtitle entry. This is important for mixed-language subtitles.
+# A whole SRT is therefore never assumed to have one source language.
+def detect_script_language(text):
+    counts = {
+        "hi": len(re.findall(r"[\u0900-\u097f]", text)),
+        "zh": len(re.findall(r"[\u4e00-\u9fff]", text)),
+        "ja": len(re.findall(r"[\u3040-\u30ff]", text)),
+        "ko": len(re.findall(r"[\uac00-\ud7af]", text)),
+        "ar": len(re.findall(r"[\u0600-\u06ff]", text)),
+        "th": len(re.findall(r"[\u0e00-\u0e7f]", text)),
+        "ru": len(re.findall(r"[\u0400-\u04ff]", text)),
+    }
+    if not text.strip():
+        return "unknown"
+    best = max(counts, key=counts.get)
+    if counts[best] > 0:
+        return best
+    if re.search(r"[A-Za-z]", text):
+        return "en"
+    return "unknown"
+
+
+def google_translate(text, target_language):
+    """Free Google Translate web endpoint; no API key is required. It is used only as a lightweight fallback engine."""
+    response = requests.get(
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client": "gtx", "sl": "auto", "tl": target_language, "dt": "t", "q": text[:4500]},
+        timeout=8,
+    )
+    response.raise_for_status()
+    data = response.json()
+    parts = data[0] if isinstance(data, list) and data else []
+    translated = "".join(part[0] for part in parts if isinstance(part, list) and part and part[0])
+    if not translated:
+        raise RuntimeError("Google Translate returned an empty result")
+    return clean_text(translated)
+
+
+def libre_translate(text, target_language):
+    last_error = None
+    # LibreTranslate uses ISO language codes; zh-CN/zh-TW are normalized to zh.
+    target = "zh" if target_language.startswith("zh-") else target_language
+    for endpoint in LIBRETRANSLATE_ENDPOINTS:
+        try:
+            response = requests.post(
+                endpoint + "/translate",
+                data={"q": text[:4500], "source": "auto", "target": target, "format": "text"},
+                timeout=8,
+            )
+            response.raise_for_status()
+            data = response.json()
+            translated = clean_text(data.get("translatedText", ""))
+            if translated:
+                return translated
+            last_error = "Empty translation returned"
+        except Exception as error:
+            last_error = error
+    raise RuntimeError(str(last_error or "LibreTranslate endpoints unavailable"))
+
+
+def mymemory_translate(text, target_language):
+    """Free MyMemory endpoint. It needs a source language, so script detection is used per subtitle."""
+    source = detect_script_language(text)
+    if source == "unknown":
+        source = "en"
+    target = "zh-CN" if target_language == "zh-CN" else ("zh-TW" if target_language == "zh-TW" else target_language)
+    if source == target or (source == "zh" and target.startswith("zh-")):
+        return text
+    response = requests.get(
+        "https://api.mymemory.translated.net/get",
+        params={"q": text[:4500], "langpair": f"{source}|{target}"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    data = response.json()
+    translated = clean_text((data.get("responseData") or {}).get("translatedText", ""))
+    if not translated:
+        raise RuntimeError("MyMemory returned an empty result")
+    return translated
+
+
+def translate_one(text, target_language, preferred_engine):
+    text = clean_text(text)
+    if not text:
+        return ""
+
+    # Do not waste network calls when the entry is already entirely in the target script/language.
+    if target_language == "en" and detect_script_language(text) == "en":
+        return text
+    if target_language == "hi" and detect_script_language(text) == "hi":
+        return text
+
+    engines = {
+        "Google Translate": google_translate,
+        "LibreTranslate": libre_translate,
+        "MyMemory": mymemory_translate,
+    }
+    ordered = [preferred_engine] + [name for name in TRANSLATION_ENGINES if name != preferred_engine]
+    errors = []
+    for name in ordered:
+        try:
+            result = engines[name](text, target_language)
+            if result:
+                return result
+        except Exception as error:
+            errors.append(f"{name}: {error}")
+    raise RuntimeError("All free translation engines failed. " + " | ".join(errors[-3:]))
+
+
+def translate_segments(segments, target_language, preferred_engine, progress_callback=None):
+    translated = []
+    total = len(segments)
+    for index, (start, end, text) in enumerate(segments, start=1):
+        translated_text = translate_one(text, target_language, preferred_engine)
+        translated.append((start, end, translated_text))
+        if progress_callback:
+            progress_callback(index, total, translated_text)
+        # Small pause prevents a free endpoint from being hammered by a long SRT.
+        time.sleep(0.05)
+    return translated
+
+
+def detect_mixed_languages(segments):
+    counts = {}
+    for _, _, text in segments:
+        code = detect_script_language(text)
+        counts[code] = counts.get(code, 0) + 1
+    meaningful = [(code, count) for code, count in counts.items() if code != "unknown"]
+    meaningful.sort(key=lambda item: item[1], reverse=True)
+    return meaningful
+
+
 def render_translation_ui(source_segments=None, source_srt=None):
     st.subheader("🌐 Subtitle Translation")
-    st.caption("Automatically detects the subtitle language, then translates the timed subtitles without changing their timestamps.")
+    st.caption("Each subtitle entry is treated independently, so a video can contain Hindi, English, Spanish, Japanese or other languages in the same file.")
 
-    uploaded_srt = st.file_uploader(
-        "Or upload an existing SRT subtitle file",
-        type=["srt"],
-        key="translation_srt_upload",
-    )
-
+    uploaded_srt = st.file_uploader("Or upload an existing SRT subtitle file", type=["srt"], key="translation_srt_upload")
     if uploaded_srt is not None:
         try:
             active_segments = parse_srt(uploaded_srt.getvalue().decode("utf-8-sig", errors="replace"))
@@ -391,26 +464,44 @@ def render_translation_ui(source_segments=None, source_srt=None):
         st.warning("No subtitle entries were found.")
         return
 
-    preview = " ".join(text for _, _, text in active_segments[:12])
-    detected, confidence = detect_language(preview)
-    language_names = {"en": "English", "hi": "Hindi", "zh": "Chinese", "ja": "Japanese", "ko": "Korean", "es": "Spanish", "fr": "French", "de": "German", "pt": "Portuguese", "ru": "Russian", "ar": "Arabic", "id": "Indonesian"}
-    detected_label = language_names.get(detected, detected.upper() if detected != "unknown" else "Unknown")
+    language_counts = detect_mixed_languages(active_segments)
+    detected_label = "Mixed / multilingual"
+    if language_counts:
+        labels = [f"{LANGUAGE_NAMES.get(code, code.upper())} ({count})" for code, count in language_counts[:4]]
+        detected_label = " · ".join(labels)
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     with col1:
         st.metric("Subtitle entries", len(active_segments))
     with col2:
-        st.metric("Detected language", detected_label)
-    with col3:
-        st.metric("Detection confidence", f"{confidence * 100:.1f}%" if confidence else "Fallback")
+        st.metric("Detected subtitle languages", detected_label)
 
-    target_label = st.selectbox("Translate subtitles into", list(TARGET_LANGUAGES.keys()), index=0, key="target_language")
+    st.markdown("### 🎯 Translation settings")
+    target_label = st.selectbox(
+        "Translate every subtitle into",
+        list(TARGET_LANGUAGES.keys()),
+        index=0,
+        key="target_language",
+    )
     target_code = TARGET_LANGUAGES[target_label]
 
-    if detected == target_code:
-        st.warning("The detected source language is the same as the selected target language. Translation may make little or no change.")
+    preferred_engine = st.selectbox(
+        "Translation engine",
+        TRANSLATION_ENGINES,
+        index=0,
+        key="translation_engine",
+        help="All three choices are free to use. If the selected engine fails, the app automatically falls back to the other free engines.",
+    )
 
-    st.caption("Engine: LibreTranslate / Argos Translate · open-source neural machine translation · free public endpoints with automatic fallback")
+    st.info("💡 Source language is detected per subtitle entry. The whole video is NOT forced into one source language.")
+    st.caption("Free engines: Google Translate web endpoint + LibreTranslate + MyMemory, with automatic fallback.")
+
+    export_mode = st.radio(
+        "Export format",
+        ["Translated only", "Original + translated (two lines)"],
+        horizontal=True,
+        key="export_mode",
+    )
 
     if st.button("🌐 Translate Subtitles", type="primary", use_container_width=True, key="translate_button"):
         progress = st.progress(0, text="Starting translation…")
@@ -428,23 +519,59 @@ def render_translation_ui(source_segments=None, source_srt=None):
             preview_box.caption(f"Latest translation: {latest}")
 
         try:
-            translated_segments = translate_segments(active_segments, target_code, on_progress)
+            translated_segments = translate_segments(active_segments, target_code, preferred_engine, on_progress)
             translated_srt = make_srt(translated_segments)
+            bilingual_srt = make_bilingual_srt(active_segments, translated_segments)
+            translated_txt = make_txt(translated_segments)
+            bilingual_txt = make_bilingual_txt(active_segments, translated_segments)
             progress.progress(1.0, text="Translation completed")
-            detail.success(f"Translated {len(translated_segments)} subtitle entries from {source_name}.")
+            detail.success(f"Translated {len(translated_segments)} subtitle entries. Mixed-language detection was applied per entry.")
 
-            st.subheader("Translated subtitles")
-            st.text_area("Translation preview", "\n".join(text for _, _, text in translated_segments), height=420)
-            st.download_button(
-                "⬇️ Download translated SRT",
-                translated_srt,
-                f"translated_{Path(source_name).stem}.srt",
-                "application/x-subrip",
-                use_container_width=True,
-            )
+            st.subheader("✨ Translation preview")
+            if export_mode == "Original + translated (two lines)":
+                preview_text = "\n".join(f"{source}\n{translation}" for (_, _, source), (_, _, translation) in zip(active_segments, translated_segments))
+            else:
+                preview_text = "\n".join(text for _, _, text in translated_segments)
+            st.text_area("Preview", preview_text, height=420)
+
+            st.markdown("### 📦 Export")
+            if export_mode == "Translated only":
+                st.download_button(
+                    "⬇️ Download translated SRT",
+                    translated_srt,
+                    f"translated_{Path(source_name).stem}.srt",
+                    "application/x-subrip",
+                    use_container_width=True,
+                )
+                st.download_button(
+                    "⬇️ Download translated TXT",
+                    translated_txt,
+                    f"translated_{Path(source_name).stem}.txt",
+                    "text/plain",
+                    use_container_width=True,
+                )
+            else:
+                st.download_button(
+                    "⬇️ Download original + translated SRT",
+                    bilingual_srt,
+                    f"bilingual_{Path(source_name).stem}.srt",
+                    "application/x-subrip",
+                    use_container_width=True,
+                )
+                st.download_button(
+                    "⬇️ Download original + translated TXT",
+                    bilingual_txt,
+                    f"bilingual_{Path(source_name).stem}.txt",
+                    "text/plain",
+                    use_container_width=True,
+                )
+
         except Exception as error:
+            progress.empty()
+            detail.empty()
+            preview_box.empty()
             st.error(f"Translation failed: {error}")
-            st.caption("The free public translation endpoints may be temporarily busy. You can retry without changing the recognition result.")
+            st.warning("The selected free engine and its fallbacks were unavailable. Your recognition result is unchanged; try the translation again or choose another engine.")
 
 
 if "segments" not in st.session_state:
@@ -456,11 +583,11 @@ if "txt_content" not in st.session_state:
 
 with st.sidebar:
     st.markdown("### ✨ Studio")
-    st.markdown("**1. Speech Recognition**\n\nMedium Whisper · Hinglish optimized")
-    st.markdown("**2. Subtitle Translation**\n\nFree Argos/LibreTranslate engine")
-    st.markdown("**3. Export**\n\nSRT · TXT")
+    st.markdown("**1. Speech Recognition**\n\nWhisper medium · Hinglish optimized")
+    st.markdown("**2. Subtitle Translation**\n\nMixed-language, per-entry detection")
+    st.markdown("**3. Export**\n\nTranslated only · Original + translated")
     st.divider()
-    st.caption("Recognition model is fixed for this version. Translation is a separate step, so it never changes your transcription result.")
+    st.caption("Recognition model and parameters are frozen for this version. Translation is completely separate from recognition.")
 
 recognition_tab, translation_tab = st.tabs(["🎙️ Speech Recognition", "🌐 Subtitle Translation"])
 
@@ -473,12 +600,7 @@ with recognition_tab:
     with feature_cols[2]:
         st.markdown('<div class="feature">⚡ <b>Resource controlled</b><br><small>CPU int8 · 2 threads</small></div>', unsafe_allow_html=True)
 
-    uploaded_file = st.file_uploader(
-        "Upload a video",
-        type=SUPPORTED_TYPES,
-        help="MP4, MOV, MKV, WebM, AVI and M4V are supported.",
-        key="video_upload",
-    )
+    uploaded_file = st.file_uploader("Upload a video", type=SUPPORTED_TYPES, help="MP4, MOV, MKV, WebM, AVI and M4V are supported.", key="video_upload")
 
     if uploaded_file is not None:
         suffix = Path(uploaded_file.name).suffix.lower()
@@ -494,7 +616,6 @@ with recognition_tab:
                 with st.status("Processing video…", expanded=True) as status:
                     status.write("📥 Video saved.")
                     status.write("🎵 Extracting 16 kHz mono PCM WAV with FFmpeg…")
-
                     progress = st.progress(0, text="Preparing recognition…")
                     progress_detail = st.empty()
                     preview_box = st.empty()
@@ -532,7 +653,6 @@ with recognition_tab:
                     status.write(f"🧠 Whisper {MODEL_SIZE} model loaded and recognition completed.")
                     progress.progress(1.0, text="Recognition finished. Validating transcript…")
                     progress_detail.success(f"Whisper returned {raw_count} raw segments. Hallucination and timestamp checks completed.")
-
                     srt_content = make_srt(segment_list)
                     txt_content = make_txt(segment_list)
                     removed = max(0, raw_count - len(segment_list))
@@ -543,7 +663,6 @@ with recognition_tab:
                 st.session_state.srt_content = srt_content
                 st.session_state.txt_content = txt_content
                 st.success("🎉 Done! Your recognition result is ready for translation.")
-
             except Exception as error:
                 st.error(f"❌ Processing failed: {error}")
 
@@ -568,4 +687,4 @@ with translation_tab:
     render_translation_ui(st.session_state.segments, st.session_state.srt_content)
 
 st.divider()
-st.caption("Hinglish Subtitle Studio · Whisper medium + FFmpeg + faster-whisper · Translation: LibreTranslate / Argos Translate")
+st.caption("Hinglish Subtitle Studio · Whisper medium + FFmpeg + faster-whisper · Translation: Google Translate + LibreTranslate + MyMemory")
