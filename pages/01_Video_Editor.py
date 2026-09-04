@@ -24,11 +24,8 @@ TIMING_RE = re.compile(
 
 def find_binary(name):
     candidates = [
-        shutil.which(name),
-        f"/usr/bin/{name}",
-        f"/usr/local/bin/{name}",
-        f"/opt/homebrew/bin/{name}",
-        f"/opt/conda/bin/{name}",
+        shutil.which(name), f"/usr/bin/{name}", f"/usr/local/bin/{name}",
+        f"/opt/homebrew/bin/{name}", f"/opt/conda/bin/{name}",
     ]
     return next((p for p in candidates if p and os.path.isfile(p) and os.access(p, os.X_OK)), None)
 
@@ -62,10 +59,11 @@ def fmt_time(seconds):
 
 
 def parse_srt(content):
-    """Parse real-world SRT by locating timing lines, not by requiring blank blocks.
+    """Parse standard and real-world SRT without assuming perfect blank-line formatting.
 
-    Supports single-language, bilingual/multilingual subtitles, CRLF/LF, BOM,
-    comma/dot milliseconds, extra timing metadata, and missing subtitle numbers.
+    A subtitle starts at a timing line and ends at the next blank line, numeric cue
+    number, or timing line. Text lines are preserved, so bilingual SRT such as
+    Hindi + Chinese remains one subtitle cue instead of becoming two cues.
     """
     content = content.replace("\r\n", "\n").replace("\r", "\n").replace("\ufeff", "")
     lines = content.split("\n")
@@ -74,14 +72,14 @@ def parse_srt(content):
     i = 0
 
     while i < len(lines):
-        timing_match = TIMING_RE.match(lines[i])
-        if not timing_match:
+        match = TIMING_RE.match(lines[i])
+        if not match:
             i += 1
             continue
 
         try:
-            start = parse_time(timing_match.group(1))
-            end = parse_time(timing_match.group(2))
+            start = parse_time(match.group(1))
+            end = parse_time(match.group(2))
         except ValueError:
             invalid += 1
             i += 1
@@ -89,10 +87,18 @@ def parse_srt(content):
 
         i += 1
         text_lines = []
-        while i < len(lines) and not TIMING_RE.match(lines[i]):
-            line = lines[i].rstrip()
-            if line.strip():
-                text_lines.append(line)
+        while i < len(lines):
+            line = lines[i]
+            if TIMING_RE.match(line):
+                break
+            if not line.strip():
+                i += 1
+                break
+            # Standard SRT cue numbers are allowed before the timing line, but
+            # if a malformed SRT omitted the blank separator, stop at a numeric cue.
+            if re.fullmatch(r"\s*\d+\s*", line) and text_lines:
+                break
+            text_lines.append(line.rstrip())
             i += 1
 
         text = "\n".join(text_lines).strip()
@@ -108,11 +114,9 @@ def probe_video(path):
     ffprobe = find_binary("ffprobe")
     if not ffprobe:
         return None
-    cmd = [
-        ffprobe, "-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=width,height,duration,r_frame_rate",
-        "-of", "default=noprint_wrappers=1", path,
-    ]
+    cmd = [ffprobe, "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=width,height,duration,r_frame_rate",
+           "-of", "default=noprint_wrappers=1", path]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return None
@@ -152,14 +156,12 @@ def ass_time(seconds):
 
 def char_width(ch):
     code = ord(ch)
-    if (
-        0x1100 <= code <= 0x11FF or 0x2E80 <= code <= 0x9FFF or
-        0xAC00 <= code <= 0xD7AF or 0xF900 <= code <= 0xFAFF or
-        0x20000 <= code <= 0x3FFFF or 0x3040 <= code <= 0x30FF or
-        0x0E00 <= code <= 0x0E7F or 0x0600 <= code <= 0x06FF or
-        0x0750 <= code <= 0x077F or 0x0590 <= code <= 0x05FF or
-        0x0900 <= code <= 0x097F
-    ):
+    if (0x1100 <= code <= 0x11FF or 0x2E80 <= code <= 0x9FFF or
+            0xAC00 <= code <= 0xD7AF or 0xF900 <= code <= 0xFAFF or
+            0x20000 <= code <= 0x3FFFF or 0x3040 <= code <= 0x30FF or
+            0x0E00 <= code <= 0x0E7F or 0x0600 <= code <= 0x06FF or
+            0x0750 <= code <= 0x077F or 0x0590 <= code <= 0x05FF or
+            0x0900 <= code <= 0x097F):
         return 2.0
     if ch.isspace() or ch in "ilI.,'`:;!|":
         return 0.45
@@ -254,7 +256,8 @@ def ass_runs(text, fallback):
         current.append(ch)
     if current:
         chunks.append((current_font, "".join(current)))
-    return "".join("{\\fn" + ass_escape(font) + "}" + ass_escape(value) for font, value in chunks)
+    return "".join("{\\fn" + ass_escape(font) + "}" + ass_escape(value)
+                   for font, value in chunks)
 
 
 def build_ass(subtitles, settings, width, height):
@@ -307,10 +310,8 @@ def render_video(input_path, ass_path, output_path):
     filter_path = ass_path.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
     vf = "subtitles='" + filter_path + "'"
     cmd = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-i", input_path,
-        "-map", "0:v:0", "-map", "0:a?",
-        "-vf", vf,
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", input_path,
+        "-map", "0:v:0", "-map", "0:a?", "-vf", vf,
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
         "-shortest", output_path,
@@ -359,7 +360,7 @@ try:
     if invalid_count:
         st.warning(f"已读取 {len(subtitles)} 条有效字幕；跳过 {invalid_count} 个无效条目。")
     else:
-        st.success(f"已读取 {len(subtitles)} 条字幕 · {info['width']}×{info['height']} · 视频 {duration:.2f}s")
+        st.success(f"已读取 {len(subtitles)} 条字幕 · {info['width']}×{info['height']} · {duration:.2f}s")
 
     if last_end > duration > 0:
         st.warning(f"字幕最后时间点为 {fmt_time(last_end)}，超过视频时长 {fmt_time(duration)}。渲染时会自动截断到视频结束。")
@@ -367,10 +368,8 @@ try:
     st.video(video)
 
     with st.expander("⏱️ 整体同步校正", expanded=True):
-        offset = st.slider(
-            "字幕整体偏移（秒）", -10.0, 10.0, 0.0, 0.05,
-            help="正数 = 字幕晚出现；负数 = 字幕提前出现。",
-        )
+        offset = st.slider("字幕整体偏移（秒）", -10.0, 10.0, 0.0, 0.05,
+                           help="正数 = 字幕晚出现；负数 = 字幕提前出现。")
 
     with st.expander("🎨 字幕样式", expanded=True):
         c1, c2, c3 = st.columns(3)
@@ -406,18 +405,9 @@ try:
             edited.append({"start": start, "end": end, "text": text})
 
     settings = {
-        "font": font,
-        "font_size": font_size,
-        "position": position,
-        "margin_v": margin_v,
-        "text_color": text_color,
-        "base_text_color": text_color,
-        "outline_color": outline_color,
-        "outline_width": outline_width,
-        "bold": bold,
-        "italic": italic,
-        "underline": underline,
-        "wrap_width": wrap_width,
+        "font": font, "font_size": font_size, "position": position, "margin_v": margin_v,
+        "text_color": text_color, "outline_color": outline_color, "outline_width": outline_width,
+        "bold": bold, "italic": italic, "underline": underline, "wrap_width": wrap_width,
     }
 
     if st.button("🔥 合成字幕视频", type="primary", use_container_width=True):
@@ -447,17 +437,14 @@ try:
         try:
             render_video(input_path, ass_path, output_path)
             progress.progress(100, text="合成完成")
-            st.success(f"视频字幕合成完成，共 {len(final_subtitles)} 条字幕。" + (f" 跳过 {skipped} 条空/无效字幕。" if skipped else ""))
+            st.success(f"视频字幕合成完成，共 {len(final_subtitles)} 条字幕。" +
+                       (f" 跳过 {skipped} 条空/无效字幕。" if skipped else ""))
             with open(output_path, "rb") as f:
                 output_bytes = f.read()
             st.video(output_bytes)
-            st.download_button(
-                "⬇️ 下载合成后的视频",
-                data=output_bytes,
-                file_name=f"{Path(video.name).stem}_subtitled.mp4",
-                mime="video/mp4",
-                use_container_width=True,
-            )
+            st.download_button("⬇️ 下载合成后的视频", data=output_bytes,
+                               file_name=f"{Path(video.name).stem}_subtitled.mp4",
+                               mime="video/mp4", use_container_width=True)
         except Exception as exc:
             progress.empty()
             st.error(f"视频合成失败：{exc}")
