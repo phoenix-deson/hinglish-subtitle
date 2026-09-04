@@ -11,7 +11,6 @@ from faster_whisper import WhisperModel
 
 st.set_page_config(page_title="Hinglish Subtitle Studio", page_icon="🎬", layout="wide")
 
-# -------------------- Configuration --------------------
 MODEL_SIZE = "distil-large-v3"
 SUPPORTED_TYPES = ["mp4", "mov", "mkv", "webm", "avi", "m4v", "flv"]
 MAX_FILE_MB = 1024
@@ -61,15 +60,19 @@ def get_duration(src):
             "-of", "default=noprint_wrappers=1:nokey=1", str(src)
         ])
         if result.returncode == 0:
+            value = result.stdout.strip()
             try:
-                return float(result.stdout.strip())
+                duration = float(value)
+                if duration > 0:
+                    return duration
             except ValueError:
                 pass
 
     ffmpeg = find_binary("ffmpeg")
     if ffmpeg:
-        result = run_command([ffmpeg, "-i", str(src)])
-        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+        result = run_command([ffmpeg, "-hide_banner", "-i", str(src)])
+        text = result.stderr or ""
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
         if match:
             h, m, s = match.groups()
             return int(h) * 3600 + int(m) * 60 + float(s)
@@ -120,7 +123,10 @@ def convert_to_mp3(src, dst):
     ]
     result = run_command(cmd)
     if result.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
-        raise RuntimeError("Audio extraction failed. The uploaded video may not contain a readable audio track.")
+        detail = (result.stderr or "").strip()
+        raise RuntimeError(
+            "Audio extraction failed. " + (detail[-1200:] if detail else "The uploaded video may not contain a readable audio track.")
+        )
 
 
 def make_srt(segments):
@@ -218,17 +224,17 @@ if uploaded_file:
             status.write("📥 Video saved to temporary storage.")
             progress.progress(8)
 
-            status.write("🔎 Checking video duration…")
+            status.write("🔎 Checking video metadata…")
             duration = get_duration(video_path)
             if duration is None:
-                raise RuntimeError("Unable to read the video duration. Please check that the file contains a valid video/audio stream.")
-
-            duration_min = duration / 60
-            if duration_min > MAX_DURATION_MINUTES:
-                raise RuntimeError(
-                    f"Video is {duration_min:.1f} minutes long. The current free-server limit is {MAX_DURATION_MINUTES} minutes."
-                )
-            status.write(f"⏱️ Duration: {duration_min:.1f} minutes")
+                status.write("⚠️ Video duration metadata is unavailable. Continuing with FFmpeg audio extraction.")
+            else:
+                duration_min = duration / 60
+                status.write(f"⏱️ Duration: {duration_min:.1f} minutes")
+                if duration_min > MAX_DURATION_MINUTES:
+                    raise RuntimeError(
+                        f"Video is {duration_min:.1f} minutes long. The current free-server limit is {MAX_DURATION_MINUTES} minutes."
+                    )
             progress.progress(15)
 
             status.write("🎵 Extracting 16 kHz mono MP3…")
@@ -238,11 +244,20 @@ if uploaded_file:
             status.write(f"✅ Audio extracted: {audio_size:.1f} MB from {original_size:.1f} MB video")
             progress.progress(35)
 
-            # Release the large uploaded video as early as possible.
             try:
                 os.remove(video_path)
             except OSError:
                 pass
+
+            if duration is None:
+                duration = get_duration(mp3_path)
+                if duration is not None:
+                    duration_min = duration / 60
+                    status.write(f"⏱️ Audio duration: {duration_min:.1f} minutes")
+                    if duration_min > MAX_DURATION_MINUTES:
+                        raise RuntimeError(
+                            f"Audio is {duration_min:.1f} minutes long. The current free-server limit is {MAX_DURATION_MINUTES} minutes."
+                        )
 
             status.write(f"🧠 Loading {MODEL_SIZE}…")
             model = load_model()
