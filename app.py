@@ -144,10 +144,13 @@ def recognition_pipeline(uploaded_file):
 
 # ---------------- AI / translation helpers ----------------
 def get_deepseek_key():
+    try:
+        key=st.secrets.get("DEEPSEEK_API_KEY")
+        if key:return str(key).strip()
+    except Exception:
+        pass
     key=os.environ.get("DEEPSEEK_API_KEY")
-    if key:return key
-    try:return st.secrets.get("DEEPSEEK_API_KEY")
-    except Exception:return None
+    return str(key).strip() if key else None
 
 def deepseek_request(messages,max_tokens=3000,temperature=0.1):
     key=get_deepseek_key()
@@ -245,7 +248,7 @@ with st.sidebar:
     st.markdown("### ✨ Studio")
     st.markdown("**1. Speech Recognition**\n\nWhisper medium · fixed accuracy baseline")
     st.markdown("**2. AI Correction**\n\nDeepSeek · optional proofreading")
-    st.markdown("**3. Translation**\n\nDeepSeek AI or free engines")
+    st.markdown("**3. Translation**\n\nFree engines by default · DeepSeek AI optional")
     st.divider(); st.caption("Recognition is frozen. AI correction and translation are separate optional layers.")
 
 recognition_tab,correction_tab,translation_tab=st.tabs(["🎙️ Speech Recognition","✨ AI Correction","🌐 Translation"])
@@ -317,8 +320,8 @@ with translation_tab:
     if active:
         langs=detect_languages(active); parts=[f"{LANGUAGE_NAMES.get(k,k)} ({v})" for k,v in sorted(langs.items(),key=lambda x:-x[1])]; c=st.columns(2); c[0].metric("Subtitle entries",len(active)); c[1].metric("Detected languages"," · ".join(parts) if parts else "Unknown")
         target_label=st.selectbox("Translate subtitles into",list(TARGET_LANGUAGES.keys()),index=0,key="target_language"); target_code=TARGET_LANGUAGES[target_label]
-        engine=st.radio("Translation engine",["🤖 DeepSeek AI (recommended)","🆓 Free translation engines (Google / LibreTranslate)"],horizontal=True,key="translation_engine_choice")
-        st.caption("DeepSeek AI uses your own DeepSeek API key. Free mode uses public endpoints and may be slower or temporarily unavailable.")
+        engine=st.selectbox("Translation engine",["🆓 Free — Google / LibreTranslate","🤖 DeepSeek AI"],index=0,key="translation_engine_choice")
+        st.caption("Free mode is the default and does not use your DeepSeek API key. DeepSeek AI is optional and uses your own key only when selected.")
         if st.button("🌐 Translate Subtitles",type="primary",use_container_width=True,key="translate_button"):
             try:
                 p=st.progress(0,text="Starting translation…");d=st.empty();started=time.time()
