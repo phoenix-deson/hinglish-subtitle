@@ -355,7 +355,7 @@ POSITION_OPTIONS = {"Bottom": 2, "Middle": 5, "Top": 8}
 def editor_find_binary(name):
     candidates = [shutil.which(name), f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/opt/homebrew/bin/{name}", f"/opt/conda/bin/{name}"]
     for path in candidates:
-        if path and os.path.isfile(path) and os.access(path, os.X_OK): return path
+        if path and os.path.isfile(path) and os.access(path,os.X_OK): return path
     return None
 
 
@@ -368,12 +368,11 @@ def editor_parse_time(value):
     value=value.strip().replace(".",",")
     match=re.fullmatch(r"(\d+):(\d{2}):(\d{2})[,.](\d{1,3})",value)
     if not match: raise ValueError(f"Invalid timestamp: {value}")
-    h,m,s,ms=match.groups(); ms=int(ms.ljust(3,"0"))[:3]
+    h,m,s,ms=match.groups(); ms=int(ms.ljust(3,"0")[:3])
     return int(h)*3600+int(m)*60+int(s)+ms/1000
 
 
 def editor_parse_srt(content):
-    # Robust SRT parser: timing lines define entries; blank lines and cue numbers are optional.
     content=content.replace("\ufeff","").replace("\r\n","\n").replace("\r","\n")
     lines=content.split("\n")
     result=[]
@@ -385,7 +384,6 @@ def editor_parse_srt(content):
             i+=1
             continue
         if "-->" not in line:
-            # Normal SRT cue number or harmless metadata.
             i+=1
             continue
         match=timing_re.match(line)
@@ -516,7 +514,6 @@ def editor_ass_runs(text,base_font):
 
 
 def editor_build_ass(subtitles,settings,width,height,duration):
-    # ASS canvas follows the real video resolution so 720p/1080p/vertical videos render correctly.
     canvas_w=max(320,int(width or 1920)); canvas_h=max(180,int(height or 1080)); scale=canvas_w/1920.0
     font_name=settings["font"]; font_size=max(12,int(round(settings["font_size"]*scale))); margin_v=max(8,int(round(settings["margin_v"]*scale))); outline_width=max(0,int(round(settings["outline_width"]*scale)))
     primary=editor_ass_color(settings["text_color"]); outline=editor_ass_color(settings["outline_color"]); bold=-1 if settings["bold"] else 0; italic=-1 if settings["italic"] else 0; underline=-1 if settings["underline"] else 0; alignment=POSITION_OPTIONS[settings["position"]]; max_units=int(settings["wrap_width"])
